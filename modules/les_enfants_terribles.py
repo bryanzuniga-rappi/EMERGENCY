@@ -22,8 +22,8 @@ import html
 import io
 import math
 import csv
+import gc
 import re
-import statistics
 import shutil
 import tempfile
 import time
@@ -49,7 +49,6 @@ from reportlab.platypus import (
 )
 
 import modelo_abasto as engine
-from modules import mail_sender
 from engines.liquid_engine import (
     LIQUID_CUT,
     LIQUID_REASON,
@@ -84,6 +83,13 @@ from mother_base_theme import (
 
 APP_NAME = "Les Enfants Terribles"
 MAX_UPLOAD_MB = 500
+PLANNING_DRIVE_FOLDER_ID = "1SfvpuHo0uhZLQb8pG5HZuJFH0bJPMu1f"
+PLANNING_DRIVE_SCOPE = "https://www.googleapis.com/auth/drive"
+GOOGLE_OAUTH_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token"
+
+
+class PlanningDriveError(RuntimeError):
+    """Error recuperable al publicar el ZIP de planeación en Drive."""
 
 
 def configured_data_transfers_spreadsheet_id() -> str:
@@ -133,6 +139,7 @@ REQUIRED_DATABASE_SHEETS = (
     "831_HV",
     "RACKEADOS",
     "CAP_RECIBO",
+    "FARMA",
     "CATALOGO",
     "KVI",
     "SHARE_VENTAS",
@@ -201,6 +208,11 @@ SHEET_DESCRIPTIONS = {
     "CAP_RECIBO": (
         "Capacidad máxima de recibo de cada tienda expresada en metros cúbicos."
     ),
+    "FARMA": (
+        "Combinaciones WAREHOUSE_ID + PRODUCT_ID que se bloquean completamente "
+        "cuando la regla «Bloquear FARMA» está activa en CODEC. La conexión de "
+        "IMPORTRANGE se valida en FARMA!A2 porque los encabezados son manuales."
+    ),
     "CATALOGO": (
         "Catálogo de surtido por tienda y producto con su ADU. Se utiliza para "
         "detectar oportunidades de quiebre y completar tareas disponibles mediante "
@@ -245,10 +257,11 @@ SHEET_DESCRIPTIONS = {
     ),
     "SCHEDULE": (
         "Frecuencia de envío permitida por combinación de WAREHOUSE_ID destino "
-        "y ORIGEN. El toggle 'Bloquear envíos fuera de frecuencia' de CODEC usa "
-        "esta hoja para impedir que un origen envíe a una tienda en un día no "
-        "programado. Un par destino-origen ausente de SCHEDULE no tiene "
-        "restricción de frecuencia."
+        "y ORIGEN; cuando existe STORAGE_TYPE, la frecuencia se aplica al SKU "
+        "según su condición (Room Temperature, Refrigerated o Freezer). El "
+        "toggle 'Bloquear envíos fuera de frecuencia' de CODEC usa esta hoja "
+        "para impedir envíos en un día no programado. Un par destino-origen "
+        "ausente de SCHEDULE no tiene restricción de frecuencia."
     ),
     "DATA": (
         "Catálogo maestro de producto (nombre, categoría, marca, maker, EAN, "
@@ -793,7 +806,6 @@ def inject_styles() -> None:
         [class*="st-key-engine_kazuhira_module"] > div {
             background: #fffdf7 !important;
             background-color: #fffdf7 !important;
-            opacity: 1 !important;
         }
 
         div[data-testid="stTextInput"] input,
@@ -992,7 +1004,14 @@ def database_sheet_type(sheet_name: str) -> str:
 def database_sheet_control(sheet_name: str) -> str:
     if sheet_name in ALEPH_SHEETS:
         return "C7"
+    if sheet_name == "FARMA":
+        return "A2"
     return "A1"
+
+
+def database_section(sheet_name: str) -> str:
+    """Segmento visible de la tarjeta de salud de DATA_TRANSFERS."""
+    return "ALEPH" if sheet_name in ALEPH_SHEETS else "INPUTS MANUALES"
 
 
 def render_kpi_cards(
@@ -1149,18 +1168,100 @@ def relative_update_text(
     return detail, healthy
 
 
-def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
-    """Valida presencia de hojas, actualizaciones Aleph y errores IMPORTRANGE."""
+def database_sheet_xml_row_counts(workbook_bytes: bytes) -> dict[str, int]:
+    """Cuenta filas de hojas directamente desde el ZIP del XLSX, en streaming.
+
+    Google Sheets puede omitir la dimensión de la hoja; ``openpyxl.max_row``
+    queda en ``None``. Iterar las celdas con openpyxl corrige el número, pero
+    dispara el uso de memoria al abrir DATA_TRANSFERS. Leer sólo los nodos
+    ``<row>`` del XML evita crear objetos por cada celda.
+    """
+    import xml.etree.ElementTree as ET
+
+    relationships_ns = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}"
+    package_ns = "{http://schemas.openxmlformats.org/package/2006/relationships}"
+    with zipfile.ZipFile(io.BytesIO(workbook_bytes)) as archive:
+        workbook_root = ET.fromstring(archive.read("xl/workbook.xml"))
+        rel_root = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
+        targets = {
+            relation.attrib["Id"]: relation.attrib["Target"]
+            for relation in rel_root.findall(f"{package_ns}Relationship")
+        }
+        sheet_paths: dict[str, str] = {}
+        for sheet in workbook_root.iter():
+            if not sheet.tag.endswith("}sheet"):
+                continue
+            name = sheet.attrib.get("name")
+            relationship_id = sheet.attrib.get(f"{relationships_ns}id")
+            target = targets.get(relationship_id or "", "")
+            if not name or not target:
+                continue
+            target = target.lstrip("/")
+            sheet_paths[name] = target if target.startswith("xl/") else f"xl/{target}"
+
+        counts: dict[str, int] = {}
+        for sheet_name in REQUIRED_DATABASE_SHEETS:
+            # Las tablas Aleph pueden contener cientos de miles de filas; su
+            # resultado exacto ya está en C6 y no deben descomprimirse aquí.
+            if sheet_name in ALEPH_SHEETS:
+                continue
+            path = sheet_paths.get(sheet_name)
+            if not path or path not in archive.namelist():
+                continue
+            count = 0
+            with archive.open(path) as stream:
+                for _event, element in ET.iterparse(stream, events=("end",)):
+                    if element.tag.endswith("}row"):
+                        count += 1
+                    element.clear()
+            counts[sheet_name] = max(count - 1, 0)
+    return counts
+
+
+def database_sheet_line_count(
+    sheet: Any,
+    sheet_name: str,
+    xml_row_counts: dict[str, int],
+) -> int:
+    """Devuelve el total exacto publicado por Aleph o el conteo XML manual."""
+    if sheet_name in ALEPH_SHEETS:
+        result_size = str(sheet["C6"].value or "")
+        match = re.search(r"([\d,]+)\s+rows?\b", result_size, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1).replace(",", ""))
+        # Sin el metadato de Aleph, no se recorre una tabla potencialmente de
+        # cientos de miles de filas sólo para el indicador visual.
+        return 0
+
+    return xml_row_counts.get(sheet_name, 0)
+
+
+def inspect_database(
+    workbook_bytes: bytes,
+    *,
+    include_locations: bool = False,
+) -> dict[str, Any] | tuple[dict[str, Any], dict[str, str], dict[int, str]]:
+    """Valida DATA_TRANSFERS y, opcionalmente, extrae ciudades/tiendas.
+
+    ``include_locations`` permite que el arranque de la app abra el XLSX una
+    sola vez: OpenPyXL conserva estructuras internas grandes incluso tras
+    cerrar un libro, por lo que abrirlo dos veces elevaba el pico de memoria.
+    """
     rows: list[dict[str, Any]] = []
-    formula_workbook = openpyxl.load_workbook(
-        io.BytesIO(workbook_bytes), read_only=True, data_only=False
-    )
-    value_workbook = openpyxl.load_workbook(
+    city_labels: dict[str, str] = {}
+    store_labels: dict[int, str] = {}
+    # La validación se ejecutaba con dos libros XLSX abiertos en paralelo
+    # (fórmulas + valores), duplicando el pico de memoria antes de planear.
+    # Abrimos la vista calculada y solo hacemos fallback a fórmulas si una
+    # celda de control no tiene valor cacheado.
+    xml_row_counts = database_sheet_xml_row_counts(workbook_bytes)
+    workbook = openpyxl.load_workbook(
         io.BytesIO(workbook_bytes), read_only=True, data_only=True
     )
+    formula_workbook = None
     try:
         for sheet_name in REQUIRED_DATABASE_SHEETS:
-            if sheet_name not in formula_workbook.sheetnames:
+            if sheet_name not in workbook.sheetnames:
                 rows.append(
                     {
                         "HOJA": sheet_name,
@@ -1172,12 +1273,16 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                 )
                 continue
 
-            formula_sheet = formula_workbook[sheet_name]
-            value_sheet = value_workbook[sheet_name]
+            sheet = workbook[sheet_name]
+            row_count = database_sheet_line_count(sheet, sheet_name, xml_row_counts)
             if sheet_name in ALEPH_SHEETS:
-                value = value_sheet["C7"].value
+                value = sheet["C7"].value
                 if value is None:
-                    value = formula_sheet["C7"].value
+                    if formula_workbook is None:
+                        formula_workbook = openpyxl.load_workbook(
+                            io.BytesIO(workbook_bytes), read_only=True, data_only=False
+                        )
+                    value = formula_workbook[sheet_name]["C7"].value
                 detail, healthy = relative_update_text(
                     value,
                     max_age_hours=ALEPH_MAX_AGE_HOURS.get(sheet_name, 24.0),
@@ -1186,24 +1291,29 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                     healthy = False
                     detail = "#REF! DETECTADO EN C7"
             elif sheet_name in MANUAL_BACKEND_SHEETS:
-                formula_value = formula_sheet["A1"].value
-                displayed_value = value_sheet["A1"].value
-                header = engine.normalize_header(
-                    displayed_value if displayed_value is not None else formula_value
-                )
+                displayed_value = sheet["A1"].value
+                if displayed_value is None:
+                    if formula_workbook is None:
+                        formula_workbook = openpyxl.load_workbook(
+                            io.BytesIO(workbook_bytes), read_only=True, data_only=False
+                        )
+                    displayed_value = formula_workbook[sheet_name]["A1"].value
+                header = engine.normalize_header(displayed_value)
                 healthy = header == "WAREHOUSE_ID"
                 detail = (
                     "BLOQUEO BACKEND DISPONIBLE"
                     if healthy
                     else "A1 DEBE SER WAREHOUSE_ID"
                 )
+            elif sheet_name == "FARMA":
+                # A1 siempre es un encabezado escrito manualmente. El #REF! de
+                # IMPORTRANGE aparece en A2; revisar A1 daría falso positivo.
+                displayed_value = sheet["A2"].value
+                healthy = not contains_ref_error(displayed_value)
+                detail = "SIN #REF!" if healthy else "#REF! DETECTADO EN A2"
             else:
-                formula_value = formula_sheet["A1"].value
-                displayed_value = value_sheet["A1"].value
-                healthy = not (
-                    contains_ref_error(formula_value)
-                    or contains_ref_error(displayed_value)
-                )
+                displayed_value = sheet["A1"].value
+                healthy = not contains_ref_error(displayed_value)
                 detail = "SIN #REF!" if healthy else "#REF! DETECTADO"
 
             rows.append(
@@ -1213,33 +1323,77 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                     "CONTROL": database_sheet_control(sheet_name),
                     "DETALLE": detail,
                     "ESTADO": "OK" if healthy else "ERROR",
+                    "LINEAS": row_count,
                 }
             )
+
+        if include_locations and "TIENDA" in workbook.sheetnames:
+            try:
+                location_rows = engine.iter_sheet_records(
+                    workbook,
+                    "TIENDA",
+                    ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"],
+                    ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"],
+                )
+                for row in location_rows:
+                    raw_city = engine.clean_text(row["CITY"])
+                    normalized_city = engine.normalize_city(raw_city)
+                    if normalized_city:
+                        city_labels.setdefault(
+                            normalized_city,
+                            CITY_DISPLAY_NAMES.get(
+                                normalized_city, raw_city or normalized_city
+                            ),
+                        )
+                    warehouse = engine.to_id(
+                        row["WAREHOUSE_ID"], "TIENDA.WAREHOUSE_ID", allow_none=True
+                    )
+                    if warehouse is not None:
+                        name = engine.clean_text(row["WAREHOUSE_NAME"])
+                        store_labels[warehouse] = f"{warehouse} - {name or 'SIN NOMBRE'}"
+            except ValueError:
+                # El estado de la base ya marcará la fuente inválida. No se
+                # pierde la pantalla completa sólo por no poder poblar filtros.
+                pass
     finally:
-        formula_workbook.close()
-        value_workbook.close()
+        workbook.close()
+        if formula_workbook is not None:
+            formula_workbook.close()
 
     healthy_count = sum(row["ESTADO"] == "OK" for row in rows)
-    return {
+    health = {
         "online": healthy_count == len(rows),
         "healthy_count": healthy_count,
         "total_count": len(rows),
         "error_count": len(rows) - healthy_count,
         "rows": rows,
     }
+    if not include_locations:
+        return health
+    preferred_order = {"CDMX": 0, "GDL": 1, "MTY": 2}
+    ordered_cities = dict(
+        sorted(
+            city_labels.items(),
+            key=lambda item: (preferred_order.get(item[0], 99), item[1].upper()),
+        )
+    )
+    ordered_stores = dict(sorted(store_labels.items(), key=lambda item: item[1].upper()))
+    return health, ordered_cities, ordered_stores
 
 
-def extract_available_cities(workbook_bytes: bytes) -> dict[str, str]:
+def extract_available_locations(workbook_bytes: bytes) -> tuple[dict[str, str], dict[int, str]]:
+    """Lee TIENDA una vez para construir las opciones de ciudad y tienda."""
     workbook = openpyxl.load_workbook(
         io.BytesIO(workbook_bytes), read_only=True, data_only=True
     )
     try:
         labels: dict[str, str] = {}
+        stores: dict[int, str] = {}
         for row in engine.iter_sheet_records(
             workbook,
             "TIENDA",
-            ["CITY"],
-            ["CITY"],
+            ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"],
+            ["CITY", "WAREHOUSE_ID", "WAREHOUSE_NAME"],
         ):
             raw_city = engine.clean_text(row["CITY"])
             normalized_city = engine.normalize_city(raw_city)
@@ -1249,11 +1403,17 @@ def extract_available_cities(workbook_bytes: bytes) -> dict[str, str]:
                 normalized_city,
                 CITY_DISPLAY_NAMES.get(normalized_city, raw_city or normalized_city),
             )
+            warehouse = engine.to_id(
+                row["WAREHOUSE_ID"], "TIENDA.WAREHOUSE_ID", allow_none=True
+            )
+            if warehouse is not None:
+                name = engine.clean_text(row["WAREHOUSE_NAME"])
+                stores[warehouse] = f"{warehouse} - {name or 'SIN NOMBRE'}"
     finally:
         workbook.close()
 
     preferred_order = {"CDMX": 0, "GDL": 1, "MTY": 2}
-    return dict(
+    cities = dict(
         sorted(
             labels.items(),
             key=lambda item: (
@@ -1262,33 +1422,17 @@ def extract_available_cities(workbook_bytes: bytes) -> dict[str, str]:
             ),
         )
     )
+    return cities, dict(sorted(stores.items(), key=lambda item: item[1].upper()))
+
+
+def extract_available_cities(workbook_bytes: bytes) -> dict[str, str]:
+    """Compatibilidad para consumidores existentes de ciudades."""
+    return extract_available_locations(workbook_bytes)[0]
 
 
 def extract_available_stores(workbook_bytes: bytes) -> dict[int, str]:
-    """Construye las opciones de tienda con formato `WAREHOUSE_ID - Nombre`."""
-    workbook = openpyxl.load_workbook(
-        io.BytesIO(workbook_bytes), read_only=True, data_only=True
-    )
-    try:
-        labels: dict[int, str] = {}
-        for row in engine.iter_sheet_records(
-            workbook,
-            "TIENDA",
-            ["WAREHOUSE_ID", "WAREHOUSE_NAME"],
-            ["WAREHOUSE_ID", "WAREHOUSE_NAME"],
-        ):
-            warehouse = engine.to_id(
-                row["WAREHOUSE_ID"],
-                "TIENDA.WAREHOUSE_ID",
-                allow_none=True,
-            )
-            if warehouse is None:
-                continue
-            name = engine.clean_text(row["WAREHOUSE_NAME"])
-            labels[warehouse] = f"{warehouse} - {name or 'SIN NOMBRE'}"
-    finally:
-        workbook.close()
-    return dict(sorted(labels.items(), key=lambda item: item[1].upper()))
+    """Compatibilidad para consumidores existentes de tiendas."""
+    return extract_available_locations(workbook_bytes)[1]
 
 
 def save_uploaded_file(uploaded_file, destination: Path) -> None:
@@ -1306,12 +1450,16 @@ COPERNICO_REQUIRED_WAREHOUSES: frozenset[int] = frozenset({444, 831, 856})
 COPERNICO_BODEGA_HEADER_ALIASES = {"BODEGA", "WAREHOUSE ID", "WAREHOUSE_ID"}
 
 
-def copernico_warehouses_from_text(text: str) -> set[int]:
-    """Bodegas de la columna Bodega de un CSV de COPÉRNICO ya decodificado."""
+def copernico_warehouses_from_stream(handle) -> set[int]:
+    """Bodegas de COPÉRNICO sin materializar el CSV completo en memoria."""
     warehouses: set[int] = set()
     # Mismo formato fijo que el lector de COPÉRNICO del motor (sin Sniffer).
-    dialect = engine.copernico_csv_dialect(text.split("\n", 1)[0])
-    reader = csv.DictReader(io.StringIO(text), dialect=dialect)
+    header_line = handle.readline()
+    if not header_line:
+        return warehouses
+    dialect = engine.copernico_csv_dialect(header_line)
+    handle.seek(0)
+    reader = csv.DictReader(handle, dialect=dialect)
     if not reader.fieldnames:
         return warehouses
     bodega_field = next(
@@ -1331,26 +1479,48 @@ def copernico_warehouses_from_text(text: str) -> set[int]:
     return warehouses
 
 
+def copernico_warehouses_from_path(path: Path) -> set[int]:
+    """Versión en streaming para los archivos ya persistidos de la corrida."""
+    with path.open("r", encoding="utf-8-sig", errors="replace", newline="") as handle:
+        return copernico_warehouses_from_stream(handle)
+
+
 def detect_copernico_warehouses(uploaded_files) -> set[int]:
-    """Lee la columna Bodega de cada archivo COPÉRNICO cargado, sin guardar nada en
-    disco, para saber qué warehouses cubre antes de validar la corrida.
-    """
+    """Lee Bodega en streaming para validar los orígenes requeridos."""
     warehouses: set[int] = set()
     for uploaded_file in uploaded_files or ():
+        text_handle = None
         try:
             uploaded_file.seek(0)
-            raw_bytes = uploaded_file.getvalue()
+            # UploadedFile de Streamlit es un stream. El fallback conserva la
+            # compatibilidad con dobles ligeros de prueba que sólo exponen
+            # getvalue(), sin afectar los archivos reales.
+            raw_handle = (
+                uploaded_file
+                if (
+                    callable(getattr(uploaded_file, "read", None))
+                    and callable(getattr(uploaded_file, "readable", None))
+                )
+                else io.BytesIO(uploaded_file.getvalue())
+            )
+            text_handle = io.TextIOWrapper(
+                raw_handle, encoding="utf-8-sig", errors="replace", newline=""
+            )
+            warehouses |= copernico_warehouses_from_stream(text_handle)
         except Exception:
             continue
-        try:
-            text = raw_bytes.decode("utf-8-sig", errors="replace")
-        except Exception:
-            continue
-        warehouses |= copernico_warehouses_from_text(text)
-        try:
-            uploaded_file.seek(0)
-        except Exception:
-            pass
+        finally:
+            # detach evita que TextIOWrapper cierre el UploadedFile de
+            # Streamlit; éste se reutiliza después para copiarlo a disco.
+            if text_handle is not None:
+                try:
+                    text_handle.detach()
+                except Exception:
+                    pass
+            try:
+                uploaded_file.seek(0)
+            except Exception:
+                pass
     return warehouses
 
 
@@ -1374,9 +1544,11 @@ def consolidate_plan_files(
     source_row_count = 0
     source_counts: Counter[str] = Counter()
     fountain9_instructions: dict[tuple[int | None, int, int], int] = defaultdict(int)
-    # Para la moda de Duration/Lead Time por tienda (ver más abajo).
-    duration_values_by_store: dict[int, list[float]] = defaultdict(list)
-    lead_time_values_by_store: dict[int, list[float]] = defaultdict(list)
+    # Una moda no requiere guardar cada observación. Counter conserva el
+    # desempate por primera aparición y evita listas proporcionales a todas
+    # las filas de Fountain9.
+    duration_counts_by_store: dict[int, Counter[float]] = defaultdict(Counter)
+    lead_time_counts_by_store: dict[int, Counter[float]] = defaultdict(Counter)
 
     for path in plan_paths:
         with path.open(
@@ -1492,11 +1664,11 @@ def consolidate_plan_files(
                 if duration_field is not None:
                     duration_value = engine.to_float(raw.get(duration_field, ""))
                     if duration_value > 0:
-                        duration_values_by_store[destination].append(duration_value)
+                        duration_counts_by_store[destination][duration_value] += 1
                 if lead_time_field is not None:
                     lead_time_value = engine.to_float(raw.get(lead_time_field, ""))
                     if lead_time_value > 0:
-                        lead_time_values_by_store[destination].append(lead_time_value)
+                        lead_time_counts_by_store[destination][lead_time_value] += 1
                 sku_field = required_lookup["SKU ID"]
                 sku = engine.to_id(
                     raw.get(sku_field, ""),
@@ -1588,47 +1760,11 @@ def consolidate_plan_files(
     if not consolidated:
         raise ValueError("Los archivos cargados no contienen requerimientos válidos.")
 
-    output_rows: list[dict[str, Any]] = []
+    # El CSV canónico sigue siendo un artefacto de la corrida, pero se escribe
+    # en streaming. Así no coexistirá una segunda lista completa de filas con
+    # el diccionario consolidado.
+    plan_rows: list[dict[str, Any]] = []
     net_transfer_hardcodes = 0
-    for key, record in consolidated.items():
-        destination, sku = key
-        destination_stock = max(
-            float(catalogs.stock_base.get((destination, sku), 0.0)),
-            0.0,
-        )
-        demand = record["PREDICTED_DEMAND"]
-        opening = record["PREDICTED_OPENING_INVENTORY"]
-        record["ROQ_INPUT"] = max(record["ROQ_INPUT"], record["FOUNTAIN9_ALLOCATION"] or 0)
-        roq_input = record["ROQ_INPUT"]
-        net_transfer = record["NET_INTER_STORE_TRANSFERS"]
-        zero_total_rule = (
-            math.isclose(demand, 0.0, abs_tol=1e-9)
-            and math.isclose(opening, 0.0, abs_tol=1e-9)
-        )
-        deficit_rule = opening < demand
-        net_transfer_rule = (
-            net_transfer_rule_enabled
-            and roq_input <= 0
-            and net_transfer <= net_transfer_max
-            and destination_stock < destination_stock_below
-            and not zero_total_rule
-            and not deficit_rule
-        )
-        record["NET_TRANSFER_HARDCODE_3"] = net_transfer_rule
-        effective_roq = 3.0 if net_transfer_rule else roq_input
-        net_transfer_hardcodes += int(net_transfer_rule)
-        output_rows.append(
-            {
-                "Warehouseid": destination,
-                "SKU ID": sku,
-                "Current Inventory": destination_stock,
-                "Predicted Demand for selected duration": demand,
-                "Predicted Opening Inventory": opening,
-                "Replenishment Quantity for Plan Duration (MOV)": effective_roq,
-                "Net Inter-Store Transfers": net_transfer,
-            }
-        )
-
     canonical_columns = [
         "Warehouseid",
         "SKU ID",
@@ -1638,26 +1774,65 @@ def consolidate_plan_files(
         "Replenishment Quantity for Plan Duration (MOV)",
         "Net Inter-Store Transfers",
     ]
-    output_rows.sort(key=lambda row: (row["Warehouseid"], row["SKU ID"]))
-    engine.write_csv(output_path, output_rows, canonical_columns)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=canonical_columns)
+        writer.writeheader()
+        for input_row, (key, record) in enumerate(sorted(consolidated.items()), start=2):
+            destination, sku = key
+            destination_stock = max(float(catalogs.stock_base.get((destination, sku), 0.0)), 0.0)
+            demand = record["PREDICTED_DEMAND"]
+            opening = record["PREDICTED_OPENING_INVENTORY"]
+            record["ROQ_INPUT"] = max(record["ROQ_INPUT"], record["FOUNTAIN9_ALLOCATION"] or 0)
+            roq_input = record["ROQ_INPUT"]
+            net_transfer = record["NET_INTER_STORE_TRANSFERS"]
+            zero_total_rule = math.isclose(demand, 0.0, abs_tol=1e-9) and math.isclose(opening, 0.0, abs_tol=1e-9)
+            net_transfer_rule = (
+                net_transfer_rule_enabled and roq_input <= 0
+                and net_transfer <= net_transfer_max
+                and destination_stock < destination_stock_below
+                and not zero_total_rule and not (opening < demand)
+            )
+            record["NET_TRANSFER_HARDCODE_3"] = net_transfer_rule
+            effective_roq = 3.0 if net_transfer_rule else roq_input
+            net_transfer_hardcodes += int(net_transfer_rule)
+            writer.writerow({
+                "Warehouseid": destination, "SKU ID": sku,
+                "Current Inventory": destination_stock,
+                "Predicted Demand for selected duration": demand,
+                "Predicted Opening Inventory": opening,
+                "Replenishment Quantity for Plan Duration (MOV)": effective_roq,
+                "Net Inter-Store Transfers": net_transfer,
+            })
+            plan_rows.append({
+                "INPUT_ROW": input_row,
+                "WAREHOUSE_DESTINATION": destination,
+                "RETAIL_ID": sku,
+                "SKU_NAME": "", "CSV_WAREHOUSE_NAME": "",
+                "CURRENT_INVENTORY": destination_stock,
+                "PREDICTED_DEMAND": demand,
+                "PREDICTED_OPENING_INVENTORY": opening,
+                "MOV_ORIGINAL": effective_roq,
+                "INPUT_DUPLICATE_COUNT": 1,
+                "INPUT_ROWS_MERGED": str(input_row),
+                "INPUT_DUPLICATE_CONFLICT": False,
+            })
 
     unique_count = len(consolidated)
     duplicated_keys = sum(
         int(record["SOURCE_ROWS"] > 1) for record in consolidated.values()
     )
-    # Moda de Duration/Lead Time por tienda — una sola vez, sobre TODAS las
-    # filas de esa tienda en TODOS los archivos cargados (no por archivo).
-    # statistics.mode() toma el primer valor más frecuente en caso de
-    # empate (determinístico, sin lanzar excepción).
+    # Counter conserva orden de inserción, por lo que max() mantiene el mismo
+    # desempate de primera aparición que tenía statistics.mode().
     duration_mode_by_store: dict[int, float] = {
-        store: statistics.mode(values)
-        for store, values in duration_values_by_store.items()
-        if values
+        store: max(counts, key=counts.get)
+        for store, counts in duration_counts_by_store.items()
+        if counts
     }
     lead_time_mode_by_store: dict[int, float] = {
-        store: statistics.mode(values)
-        for store, values in lead_time_values_by_store.items()
-        if values
+        store: max(counts, key=counts.get)
+        for store, counts in lead_time_counts_by_store.items()
+        if counts
     }
     summary = {
         "files": len(plan_paths),
@@ -1691,6 +1866,16 @@ def consolidate_plan_files(
                 ),
             )
         ],
+        # execute_planning lo extrae enseguida con pop(), evitando conservar
+        # una segunda representación de la planeación en el resumen final.
+        "_plan_read": engine.PlanReadResult(
+            rows=plan_rows,
+            warnings=[],
+            input_row_count=source_row_count,
+            duplicate_row_count=max(source_row_count - unique_count, 0),
+            duplicate_key_count=duplicated_keys,
+            conflicting_duplicate_key_count=0,
+        ),
     }
     return output_path, consolidated, summary
 
@@ -1731,7 +1916,13 @@ def build_naked_fountain9_rows(
     instructions: list[dict[str, Any]],
     plan_rows: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Arma la cola estricta de Naked desde Allocation (DOI Based)."""
+    """Arma la cola Naked desde Allocation (DOI Based).
+
+    Fountain9 define la necesidad (destino, SKU y cantidad). Naked consume el
+    inventario desde todos los orígenes del CODEC, respetando exactamente el
+    orden elegido por el usuario; la fuente original de Fountain9 se conserva
+    exclusivamente para auditoría.
+    """
     by_key = {
         (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"])): row
         for row in plan_rows
@@ -1749,6 +1940,7 @@ def build_naked_fountain9_rows(
                 "FORCED_SOURCE": instruction.get("WAREHOUSE_SOURCE"),
                 "FORCED_RULE": "FOUNTAIN9_DOI",
                 "ALLOW_PARTIAL": True,
+                "SOURCE_PRIORITY_CODEC": True,
             }
         )
         naked_rows.append(base)
@@ -1813,6 +2005,12 @@ def omit_unexecuted_manual_task_rows(result) -> None:
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_public_database() -> bytes:
     """Exporta el Google Sheet público completo como XLSX y conserva 5 min de caché."""
+    # Adaptador para Snowflake Workspaces: el entrypoint puede cargar una
+    # copia local de DATA_TRANSFERS al estado de sesión. En producción esta
+    # llave no existe y el flujo de Google Sheets permanece idéntico.
+    workspace_database = st.session_state.get("mb_workspace_database_bytes")
+    if workspace_database:
+        return bytes(workspace_database)
     spreadsheet_id = configured_data_transfers_spreadsheet_id()
     if not spreadsheet_id:
         raise RuntimeError(
@@ -1854,11 +2052,14 @@ def load_database_resource() -> dict[str, Any]:
     """Descarga, inspecciona y conserva la base entre todos los reruns normales."""
     try:
         workbook_bytes = fetch_public_database()
+        health, city_labels, store_labels = inspect_database(
+            workbook_bytes, include_locations=True
+        )
         return {
             "workbook_bytes": workbook_bytes,
-            "health": inspect_database(workbook_bytes),
-            "city_labels": extract_available_cities(workbook_bytes),
-            "store_labels": extract_available_stores(workbook_bytes),
+            "health": health,
+            "city_labels": city_labels,
+            "store_labels": store_labels,
             "error": "",
         }
     except Exception as exc:
@@ -2206,7 +2407,7 @@ def _diagnose_uncovered_bucket_reason(
         ):
             per_origin_reasons.append(f"{source}: BLOQUEO REGIONAL")
             continue
-        if engine.is_schedule_blocked(catalogs, source, destination):
+        if engine.is_schedule_blocked(catalogs, source, destination, sku):
             per_origin_reasons.append(f"{source}: BLOQUEO POR FRECUENCIA")
             continue
         if (destination, sku) in catalogs.route_cost_blocks:
@@ -2515,7 +2716,7 @@ def append_insumos_to_bulk_444(
         ):
             summary["lines_blocked_regional"] += 1
             continue
-        if engine.is_schedule_blocked(catalogs, 444, destination):
+        if engine.is_schedule_blocked(catalogs, 444, destination, sku):
             summary["lines_blocked_schedule"] += 1
             continue
         selected_requested.append(row)
@@ -2761,14 +2962,13 @@ def rewrite_bulk_csvs_with_planning_reason(
         )
 
 
-def sort_health_rows_for_display(
-    rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Agrupa las tarjetas de salud por tipo — IMPORTRANGE/BACKEND primero, ALEPH
-    después — en vez del orden de REQUIRED_DATABASE_SHEETS, que los mezcla.
-    """
-    card_type_priority = {"IMPORTRANGE": 0, "BACKEND": 0, "ALEPH": 1}
-    return sorted(rows, key=lambda row: card_type_priority.get(row["TIPO"], 0))
+def sort_health_rows_for_display(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Agrupa para pantalla: Inputs manuales primero, después Aleph."""
+    section_priority = {"INPUTS MANUALES": 0, "ALEPH": 1}
+    return sorted(
+        rows,
+        key=lambda row: section_priority.get(database_section(row["HOJA"]), 0),
+    )
 
 
 def render_database_health(health: dict[str, Any]) -> None:
@@ -2785,36 +2985,42 @@ def render_database_health(health: dict[str, Any]) -> None:
     )
 
     rows = sort_health_rows_for_display(health["rows"])
-    for start in range(0, len(rows), 4):
-        columns = st.columns(4)
-        for column, row in zip(columns, rows[start : start + 4]):
-            card_class = "ok" if row["ESTADO"] == "OK" else "error"
-            if row["TIPO"] == "ALEPH":
-                card_meta = "ÚLTIMA ACTUALIZACIÓN"
-            elif row["TIPO"] == "BACKEND":
-                card_meta = "BLOQUEO PERMANENTE"
-            else:
-                card_meta = "CONEXIÓN IMPORTRANGE"
-            show_result = row["TIPO"] == "ALEPH" or row["ESTADO"] == "ERROR"
-            result_html = (
-                f'<div class="source-card-result">{html.escape(row["DETALLE"])}</div>'
-                if show_result
-                else ""
-            )
-            description = SHEET_DESCRIPTIONS.get(
-                row["HOJA"], "Fuente de información utilizada por el modelo de abasto."
-            )
-            card_html = (
-                f'<div class="source-card {card_class}">'
-                f'<div><div class="source-card-name">{html.escape(row["HOJA"])}</div>'
-                f'<div class="source-card-meta">{card_meta}</div></div>'
-                f'{result_html}'
-                f'<div class="source-card-tooltip"><strong>QUÉ CONTIENE</strong>'
-                f'{html.escape(description)}</div>'
-                '</div>'
-            )
-            with column:
-                st.markdown(card_html, unsafe_allow_html=True)
+    for section in ("INPUTS MANUALES", "ALEPH"):
+        section_rows = [row for row in rows if database_section(row["HOJA"]) == section]
+        if not section_rows:
+            continue
+        st.markdown(f'<span class="section-label">{section}</span>', unsafe_allow_html=True)
+        for start in range(0, len(section_rows), 4):
+            columns = st.columns(4)
+            for column, row in zip(columns, section_rows[start : start + 4]):
+                card_class = "ok" if row["ESTADO"] == "OK" else "error"
+                if row["TIPO"] == "ALEPH":
+                    card_meta = "ÚLTIMA ACTUALIZACIÓN"
+                elif row["TIPO"] == "BACKEND":
+                    card_meta = "BLOQUEO PERMANENTE"
+                else:
+                    card_meta = "CONEXIÓN IMPORTRANGE"
+                show_result = row["TIPO"] == "ALEPH" or row["ESTADO"] == "ERROR"
+                result_html = (
+                    f'<div class="source-card-result">{html.escape(row["DETALLE"])}</div>'
+                    if show_result
+                    else ""
+                )
+                description = SHEET_DESCRIPTIONS.get(
+                    row["HOJA"], "Fuente de información utilizada por el modelo de abasto."
+                )
+                card_html = (
+                    f'<div class="source-card {card_class}">' 
+                    f'<div><div class="source-card-name">{html.escape(row["HOJA"])}</div>'
+                    f'<div class="source-card-meta">{card_meta}</div></div>'
+                    f'<div class="source-card-meta">{int(row.get("LINEAS", 0)):,} LÍNEAS</div>'
+                    f'{result_html}'
+                    f'<div class="source-card-tooltip"><strong>QUÉ CONTIENE</strong>'
+                    f'{html.escape(description)}</div>'
+                    '</div>'
+                )
+                with column:
+                    st.markdown(card_html, unsafe_allow_html=True)
 
     if not online:
         st.error(
@@ -5684,7 +5890,7 @@ def apply_avl_fill(
                 city_norm,
                 is_golden,
             )
-            schedule_block = engine.is_schedule_blocked(catalogs, source, destination)
+            schedule_block = engine.is_schedule_blocked(catalogs, source, destination, sku)
             regional_blocks[source] = regional_block
             schedule_blocks[source] = schedule_block
             if regional_block or schedule_block:
@@ -5711,7 +5917,7 @@ def apply_avl_fill(
                 is_golden,
             )
             schedule_blocks[source] = engine.is_schedule_blocked(
-                catalogs, source, destination
+                catalogs, source, destination, sku
             )
 
         available_task_slots = (
@@ -6730,6 +6936,7 @@ def execute_planning(
     enable_closed_stores_rule: bool = True,
     enable_regional_block_rule: bool = True,
     enable_global_blocks_rule: bool = True,
+    enable_farma_block_rule: bool = True,
     ignore_store_capacity: bool = False,
     enable_route_cost_block_rule: bool = True,
     simulation_mode: bool = False,
@@ -6788,6 +6995,12 @@ def execute_planning(
     venom_manual_skus_by_origin: dict[int, set[int]] | None = None,
     venom_only_manual_skus: bool = False,
 ) -> dict[str, Any]:
+    # El resultado anterior puede contener cientos de miles de diccionarios y
+    # permanecer en session_state mientras se construye la siguiente corrida.
+    # Liberarlo antes de abrir el XLSX evita que dos planeaciones convivan en
+    # memoria durante el pico de carga.
+    st.session_state.pop("last_run", None)
+    gc.collect()
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
     st.session_state["last_workspace"] = str(workspace)
@@ -6831,6 +7044,9 @@ def execute_planning(
         save_uploaded_file(uploaded_plan, plan_path)
         plan_paths.append(plan_path)
     save_database(database_bytes, data_path)
+    # El archivo ya está persistido; no mantengas otra referencia local al
+    # XLSX comprimido mientras openpyxl construye los catálogos.
+    del database_bytes
 
     config = engine.Config(
         origin_warehouses=origins,
@@ -6892,6 +7108,26 @@ def execute_planning(
                 "de bloquearse (la exclusión manual de SKUs sigue aplicando)."
             )
             catalogs.globally_blocked_skus = set()
+        # Compatibilidad con despliegues que actualizaron esta pantalla antes
+        # de modelo_abasto.py. Sin esto una instalación parcial no debe tumbar
+        # toda la planeación; al actualizar ambos archivos, el conjunto viene
+        # cargado desde la hoja FARMA normalmente.
+        farma_block_pairs = set(getattr(catalogs, "farma_block_pairs", set()))
+        if enable_farma_block_rule:
+            # Se incorpora al filtro universal destino-SKU para que Naked,
+            # Otacon, Solidus, Shalashaska, Liquid, Venom y Kazuhira vean la
+            # misma regla antes de reservar inventario o tareas.
+            catalogs.route_cost_blocks |= farma_block_pairs
+            if farma_block_pairs:
+                catalogs.warnings.append(
+                    "Bloqueo FARMA activo: se bloquearon completamente "
+                    f"{len(farma_block_pairs):,} combinaciones destino-SKU."
+                )
+        elif farma_block_pairs:
+            catalogs.warnings.append(
+                "Regla FARMA desactivada para esta corrida desde CODEC: "
+                f"{len(farma_block_pairs):,} combinaciones dejaron de bloquearse."
+            )
         if ignore_store_capacity:
             catalogs.warnings.append(
                 "Capacidad de tienda ignorada en todos los engines desde CODEC: "
@@ -6957,7 +7193,9 @@ def execute_planning(
                 destination_stock_below=destination_stock_below,
             )
         )
-        plan_read = engine.read_plan_csv(plan_path, config)
+        # Ya se construyó al escribir el canónico; releer el CSV completo
+        # duplicaba el pico de memoria sin cambiar reglas ni resultados.
+        plan_read = consolidation_summary.pop("_plan_read")
         enrich_consolidated_plan_read(
             plan_read,
             consolidated_input,
@@ -8127,9 +8365,7 @@ def execute_planning(
             {
                 "path": str(path),
                 "warehouses": sorted(
-                    copernico_warehouses_from_text(
-                        path.read_text(encoding="utf-8-sig", errors="replace")
-                    )
+                    copernico_warehouses_from_path(path)
                 ),
             }
             for path in copernico_paths
@@ -8179,9 +8415,8 @@ def render_capped_dataframe(
         st.info("No existen registros para mostrar en esta sección.")
         return
     total = len(rows)
-    visible = min(total, max_display)
     display_rows = rows[:max_display]
-    height = (visible + 1) * 36 + 4
+    height = (min(total, max_display) + 1) * 36 + 4
     st.dataframe(
         display_rows,
         use_container_width=True,
@@ -9225,55 +9460,228 @@ def render_engine_header(
     render_kpi_cards(cards, columns_count=4)
 
 
-def render_mail_section(run: dict[str, Any]) -> None:
-    """Un solo botón: manda por correo COPÉRNICO, BASE_TRANSFERS, Sin recomendación y
-    OVERVIEW de la corrida a una lista editable de destinatarios."""
-    st.markdown('<span class="section-label">ENVIAR POR MAIL</span>', unsafe_allow_html=True)
-    if run.get("simulation"):
-        st.caption("Modo simulación: la corrida no generó archivos que enviar.")
-        return
-    st.caption("Un solo correo con " + ", ".join(mail_sender.preview_names(run)) + ".")
-    recipients_text = st.text_area(
-        "Destinatarios (uno por línea)",
-        value="\n".join(mail_sender.DEFAULT_RECIPIENTS),
-        key="mb_mail_recipients",
-        height=100,
-        help="También acepta comas o punto y coma. Se envía desde la cuenta de Google autorizada en Secrets.",
+def _planning_drive_secret(name: str) -> str:
+    """Lee un secreto simple sin depender de que Streamlit esté inicializado."""
+    try:
+        value = st.secrets.get(name, "")
+    except Exception:
+        return ""
+    return str(value or "").strip()
+
+
+def configured_planning_drive_folder_id() -> str:
+    """Carpeta de entregables de Les Enfants, configurable sin cambiar código.
+
+    El valor histórico se mantiene como respaldo para no romper corridas ya
+    desplegadas. La configuración explícita permite mover la carpeta o usar
+    una distinta a la que consume Militaires Sans Frontières.
+    """
+    return _planning_drive_secret("PLANNING_DRIVE_FOLDER_ID") or PLANNING_DRIVE_FOLDER_ID
+
+
+def _planning_drive_service_account_info() -> dict[str, Any]:
+    """Obtiene la cuenta de servicio que ya tenía acceso a la carpeta operativa."""
+    try:
+        info = st.secrets["gcp_service_account"]
+    except Exception as error:
+        raise PlanningDriveError(
+            "Falta [gcp_service_account] en Secrets para subir el ZIP a Drive."
+        ) from error
+    try:
+        return dict(info)
+    except (TypeError, ValueError) as error:
+        raise PlanningDriveError(
+            "[gcp_service_account] no tiene un formato válido para Drive."
+        ) from error
+
+
+def _planning_drive_oauth_values() -> tuple[str, str, str]:
+    """Obtiene OAuth reutilizable de Mother Base, priorizando Les Enfants."""
+    client_id = (
+        _planning_drive_secret("PLANNING_DRIVE_OAUTH_CLIENT_ID")
+        or _planning_drive_secret("DATA_DASHBOARD_OAUTH_CLIENT_ID")
     )
-    recipients, invalid = mail_sender.parse_recipients(recipients_text)
-    if invalid:
-        st.warning("Direcciones no válidas: " + ", ".join(invalid))
-    if st.button(
-        "Enviar por mail",
-        key="mb_mail_send",
-        disabled=bool(invalid) or not recipients,
-    ):
-        with st.spinner("Armando y enviando el correo…"):
+    client_secret = (
+        _planning_drive_secret("PLANNING_DRIVE_OAUTH_CLIENT_SECRET")
+        or _planning_drive_secret("DATA_DASHBOARD_OAUTH_CLIENT_SECRET")
+    )
+    refresh_token = (
+        _planning_drive_secret("PLANNING_DRIVE_OAUTH_REFRESH_TOKEN")
+        or _planning_drive_secret("DATA_DASHBOARD_OAUTH_REFRESH_TOKEN")
+        or _planning_drive_secret("MAIL_OAUTH_REFRESH_TOKEN")
+    )
+    return client_id, client_secret, refresh_token
+
+
+def _build_planning_drive_service() -> Any:
+    """Crea el cliente de Drive de Les Enfants sin depender de Militaires.
+
+    Antes esta pantalla sólo aceptaba una cuenta de servicio. Eso se rompía al
+    migrar/configurar Drive con OAuth de usuario en Mother Base: el token sí
+    existía, pero Les Enfants lo ignoraba. Ahora acepta ambos mecanismos.
+    """
+    try:
+        from google.oauth2 import service_account
+        from google.oauth2.credentials import Credentials as OAuthUserCredentials
+        from googleapiclient.discovery import build as build_drive_service
+
+        client_id, client_secret, refresh_token = _planning_drive_oauth_values()
+        if refresh_token:
+            if not client_id or not client_secret:
+                raise PlanningDriveError(
+                    "Hay un refresh token de Google, pero faltan "
+                    "DATA_DASHBOARD_OAUTH_CLIENT_ID/CLIENT_SECRET (o sus "
+                    "equivalentes PLANNING_DRIVE_OAUTH_*)."
+                )
+            credentials = OAuthUserCredentials(
+                None,
+                refresh_token=refresh_token,
+                client_id=client_id,
+                client_secret=client_secret,
+                token_uri=GOOGLE_OAUTH_TOKEN_ENDPOINT,
+                scopes=[PLANNING_DRIVE_SCOPE],
+            )
+        else:
+            credentials = service_account.Credentials.from_service_account_info(
+                _planning_drive_service_account_info(),
+                scopes=[PLANNING_DRIVE_SCOPE],
+            )
+            impersonate_email = (
+                _planning_drive_secret("PLANNING_DRIVE_IMPERSONATE_EMAIL")
+                or _planning_drive_secret("DATA_DASHBOARD_IMPERSONATE_EMAIL")
+            )
+            if impersonate_email:
+                credentials = credentials.with_subject(impersonate_email)
+        return build_drive_service(
+            "drive", "v3", credentials=credentials, cache_discovery=False
+        )
+    except PlanningDriveError:
+        raise
+    except Exception as error:
+        raise PlanningDriveError(
+            f"No se pudieron preparar las credenciales de Drive: {error}"
+        ) from error
+
+
+def planning_drive_package_name(run: dict[str, Any]) -> str:
+    """Nombre operativo del ZIP, estable para una corrida y sus orígenes."""
+    origins: list[str] = []
+    for origin in run.get("origins", []):
+        try:
+            origins.append(str(int(origin)))
+        except (TypeError, ValueError):
+            if str(origin).strip():
+                origins.append(str(origin).strip())
+    raw_date = str(run.get("run_date") or "").strip()
+    try:
+        label = date.fromisoformat(raw_date).strftime("%d-%m-%Y")
+    except ValueError:
+        match = re.search(r"(\d{2}-\d{2}-\d{4})", Path(str(run.get("zip", ""))).name)
+        label = (
+            match.group(1)
+            if match
+            else datetime.now(ZoneInfo("America/Mexico_City")).strftime("%d-%m-%Y")
+        )
+    return f"TR_{'_'.join(origins) or 'SIN_ORIGEN'}_{label}.zip"
+
+
+def upload_planning_zip_to_drive(
+    run: dict[str, Any], *, service: Any | None = None, media_upload_factory: Any | None = None
+) -> str:
+    """Publica el ZIP ya generado; evita duplicarlo en memoria antes de subirlo."""
+    zip_path = Path(str(run.get("zip") or ""))
+    if not zip_path.is_file() or zip_path.stat().st_size == 0:
+        raise PlanningDriveError("La corrida no tiene un ZIP válido para subir a Drive.")
+    try:
+        if media_upload_factory is None:
+            from googleapiclient.http import MediaFileUpload
+
+            media_upload_factory = MediaFileUpload
+        drive_service = service or _build_planning_drive_service()
+        folder_id = configured_planning_drive_folder_id()
+        # Falla antes de iniciar una subida pesada y distingue carpeta/permisos
+        # de un problema del ZIP. También valida correctamente Shared Drives.
+        drive_service.files().get(
+            fileId=folder_id,
+            fields="id,name,driveId",
+            supportsAllDrives=True,
+        ).execute()
+        response = drive_service.files().create(
+            body={
+                "name": planning_drive_package_name(run),
+                "parents": [folder_id],
+                "mimeType": "application/zip",
+            },
+            media_body=media_upload_factory(
+                str(zip_path), mimetype="application/zip", resumable=True
+            ),
+            supportsAllDrives=True,
+            fields="id,name,webViewLink",
+        ).execute()
+    except PlanningDriveError:
+        raise
+    except Exception as error:
+        raise PlanningDriveError(f"No se pudo subir el ZIP a Drive: {error}") from error
+    if response.get("webViewLink"):
+        return str(response["webViewLink"])
+    if response.get("id"):
+        # Un ID solo no es un enlace navegable en Streamlit.
+        return f"https://drive.google.com/open?id={response['id']}"
+    return planning_drive_package_name(run)
+
+
+def test_planning_drive_connection(service: Any | None = None) -> str:
+    """Comprueba credenciales y acceso a la carpeta sin subir ningún archivo."""
+    try:
+        drive_service = service or _build_planning_drive_service()
+        folder = drive_service.files().get(
+            fileId=configured_planning_drive_folder_id(),
+            fields="id,name,driveId",
+            supportsAllDrives=True,
+        ).execute()
+        place = "Drive compartido" if folder.get("driveId") else "Mi unidad"
+        return f"Conexión lista: carpeta {folder.get('name', folder['id'])} ({place})."
+    except PlanningDriveError:
+        raise
+    except Exception as error:
+        raise PlanningDriveError(f"No se pudo validar la carpeta de Drive: {error}") from error
+
+
+def render_planning_drive_section(run: dict[str, Any]) -> None:
+    """Sube el paquete ZIP de la corrida a Drive desde Les Enfants Terribles."""
+    st.markdown('<span class="section-label">SUBIR A DRIVE</span>', unsafe_allow_html=True)
+    if run.get("simulation"):
+        st.caption("Modo simulación: la corrida no generó archivos que subir.")
+        return
+    st.caption("El paquete se guardará en Drive como " + planning_drive_package_name(run) + ".")
+    with st.expander("Diagnóstico de conexión a Drive", expanded=False):
+        st.caption("Valida credenciales y acceso a la carpeta sin subir archivos.")
+        if st.button("Probar conexión con Drive", key="mb_planning_drive_test"):
             try:
-                result = mail_sender.send_run_package(run, recipients)
-            except mail_sender.MailError as error:
+                st.success(test_planning_drive_connection())
+            except PlanningDriveError as error:
+                st.error(str(error))
+    if st.button(
+        "Subir ZIP a Drive",
+        key="mb_planning_drive_upload",
+    ):
+        with st.spinner("Subiendo el ZIP a Drive…"):
+            try:
+                drive_link = upload_planning_zip_to_drive(run)
+            except PlanningDriveError as error:
                 st.error(str(error))
             except Exception as error:  # nunca debe tumbar la pantalla de resultados
-                st.error(f"No se pudo enviar el correo: {error}")
+                st.error(f"No se pudo subir el ZIP a Drive: {error}")
             else:
-                st.session_state["mb_mail_last"] = {
+                st.session_state["mb_planning_drive_last"] = {
                     "run": str(run.get("zip")),
-                    "recipients": result.recipients,
-                    "attachments": result.attachments,
-                    "notes": result.notes,
+                    "drive_link": drive_link,
+                    "filename": planning_drive_package_name(run),
                 }
-    last = st.session_state.get("mb_mail_last")
+    last = st.session_state.get("mb_planning_drive_last")
     if last and last.get("run") == str(run.get("zip")):
-        sent = ", ".join(
-            f"{name} ({size / 1024 / 1024:,.1f} MB)" for name, size in last["attachments"]
-        )
-        st.success(
-            f"Correo enviado a {len(last['recipients'])} destinatario(s): "
-            + ", ".join(last["recipients"])
-            + f". Adjuntos: {sent}."
-        )
-        for note in last.get("notes", []):
-            st.caption(note)
+        st.success("ZIP subido a Drive.")
+        st.markdown(f"[Abrir archivo en Drive]({last['drive_link']})")
 
 
 def render_engine_summary_table(
@@ -9490,7 +9898,7 @@ def render_results(run: dict[str, Any]) -> None:
         columns_count=3,
     )
 
-    render_mail_section(run)
+    render_planning_drive_section(run)
 
     st.markdown(
         '<div class="result-title">CIUDADES + TIENDAS ATENDIDAS.</div>',
@@ -11202,7 +11610,7 @@ def render() -> None:
         )
 
         st.markdown("###### Reglas activas por default — desactivar es la excepción")
-        rules_col1, rules_col2, rules_col3, rules_col4, rules_col5 = st.columns(5)
+        rules_col1, rules_col2, rules_col3, rules_col4, rules_col5, rules_col6 = st.columns(6)
         with rules_col1:
             enable_rackeados_rule = st.toggle(
                 "Regla de rackeados",
@@ -11248,6 +11656,16 @@ def render() -> None:
                     "Si se apaga, los SKUs de la hoja BLOQUEOS dejan de excluirse "
                     "de todos los engines. La exclusión manual de SKUs sigue "
                     "aplicando. No confundir con BLOQUEOS_FORANEAS (bloqueo regional)."
+                ),
+            )
+        with rules_col6:
+            enable_farma_block_rule = st.toggle(
+                "Bloquear FARMA",
+                value=True,
+                help=(
+                    "Bloquea por completo cada combinación WAREHOUSE_ID + PRODUCT_ID "
+                    "de la hoja FARMA. Si FARMA!A2 tiene #REF!, se avisa y no se "
+                    "interpreta la hoja."
                 ),
             )
 
@@ -11335,13 +11753,17 @@ def render() -> None:
             "nunca lo exceden."
         )
 
+    # Big Boss inicia con toda la secuencia operativa activa, excepto Venom.
+    # Raiden conserva su configuración restringida y los bloqueos explícitos
+    # de los engines que no puede ejecutar más abajo.
+    big_boss_engine_default = not is_raiden
     st.session_state.setdefault("mb_engine_naked_enabled", True)
     st.session_state.setdefault("mb_engine_otacon_enabled", True)
-    st.session_state.setdefault("mb_engine_solidus_enabled", True)
-    st.session_state.setdefault("mb_engine_shalashaska_enabled", False)
-    st.session_state.setdefault("mb_engine_liquid_enabled", False)
+    st.session_state.setdefault("mb_engine_solidus_enabled", big_boss_engine_default)
+    st.session_state.setdefault("mb_engine_shalashaska_enabled", big_boss_engine_default)
+    st.session_state.setdefault("mb_engine_liquid_enabled", big_boss_engine_default)
     st.session_state.setdefault("mb_engine_venom_enabled", False)
-    st.session_state.setdefault("mb_engine_kazuhira_enabled", False)
+    st.session_state.setdefault("mb_engine_kazuhira_enabled", big_boss_engine_default)
     st.session_state.setdefault("mb_kazuhira_ignore_task_budget", False)
     st.session_state.setdefault("mb_kazuhira_ignore_store_capacity", False)
     st.session_state.setdefault("mb_kazuhira_swa_priority", False)
@@ -12359,6 +12781,7 @@ def render() -> None:
                     enable_closed_stores_rule=enable_closed_stores_rule,
                     enable_regional_block_rule=enable_regional_block_rule,
                     enable_global_blocks_rule=enable_global_blocks_rule,
+                    enable_farma_block_rule=enable_farma_block_rule,
                     ignore_store_capacity=ignore_store_capacity,
                     enable_route_cost_block_rule=enable_route_cost_block_rule,
                     simulation_mode=simulation_mode,

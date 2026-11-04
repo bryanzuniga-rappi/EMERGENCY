@@ -30,7 +30,7 @@ import xlsxwriter
 class Config:
     # El orden representa la prioridad de consumo del stock.
     origin_warehouses: tuple[int, ...] = (811, 834)
-    max_tasks: int = 14_000
+    max_tasks: int = 11_000
 
     # None usa la fecha actual de Ciudad de México.
     # Para reprocesar: "28-08-2026".
@@ -261,6 +261,7 @@ def iter_schedule_records(workbook) -> Iterator[dict[str, Any]]:
         "ORIGEN": "ORIGEN",
         "DAYS": "DAYS",
     }
+    optional_aliases = {"STORAGE_TYPE": "STORAGETYPE"}
     header_row: int | None = None
     positions: dict[str, int] = {}
     for row_number, row in enumerate(
@@ -272,6 +273,8 @@ def iter_schedule_records(workbook) -> Iterator[dict[str, Any]]:
             for target, alias in alias_targets.items():
                 if squashed == alias and target not in found:
                     found[target] = column_index
+            if squashed == optional_aliases["STORAGE_TYPE"]:
+                found["STORAGE_TYPE"] = column_index
         if set(alias_targets) <= set(found):
             header_row, positions = row_number, found
             break
@@ -291,6 +294,11 @@ def iter_schedule_records(workbook) -> Iterator[dict[str, Any]]:
                 row[positions["ORIGEN"]] if positions["ORIGEN"] < len(row) else None
             ),
             "DAYS": row[positions["DAYS"]] if positions["DAYS"] < len(row) else None,
+            "STORAGE_TYPE": (
+                row[positions["STORAGE_TYPE"]]
+                if positions.get("STORAGE_TYPE", len(row)) < len(row)
+                else None
+            ),
         }
         if any(clean_text(value) for value in record.values()):
             yield record
@@ -658,6 +666,10 @@ class Catalogs:
     schedule_days: dict[tuple[int, int], frozenset[str]] = field(
         default_factory=dict
     )
+    # SCHEDULE con STORAGE_TYPE: (destino, origen, storage_type) -> días.
+    schedule_days_by_storage: dict[tuple[int, int, str], frozenset[str]] = field(
+        default_factory=dict
+    )
     # Toggle de CODEC "Bloquear envíos fuera de frecuencia". Apagado por
     # default para no alterar corridas existentes.
     schedule_block_enabled: bool = False
@@ -674,6 +686,9 @@ class Catalogs:
     # SKUs de la hoja BLOQUEOS (columna PRODUCT_ID) que nunca se envían a
     # ningún lugar, mantenidos directamente por negocio en DATA_TRANSFERS.
     globally_blocked_skus: set[int] = field(default_factory=set)
+    # FARMA bloquea únicamente una combinación destino-SKU. La hoja viene de
+    # IMPORTRANGE y puede no estar disponible temporalmente (#REF! en A2).
+    farma_block_pairs: set[tuple[int, int]] = field(default_factory=set)
     # Catálogo maestro de producto (hoja DATA), por SYNC_ID -> nombre y
     # categoría.
     product_catalog: dict[int, dict[str, str]] = field(default_factory=dict)
@@ -728,6 +743,27 @@ def load_catalogs(
             for row in iter_sheet_records(workbook, "BLOQUEOS", ["PRODUCT_ID"])
         }
         globally_blocked_skus.discard(None)
+
+        # FARMA tiene encabezados manuales en la fila 1. La disponibilidad del
+        # IMPORTRANGE se valida exclusivamente en A2: A1 nunca debe usarse
+        # como señal de #REF! porque siempre contiene WAREHOUSE_ID.
+        farma_block_pairs: set[tuple[int, int]] = set()
+        if "FARMA" in workbook.sheetnames:
+            farma_a2 = workbook["FARMA"].cell(row=2, column=1).value
+            if clean_text(farma_a2).upper() == "#REF!":
+                warnings.append(
+                    "FARMA no se aplicó: el IMPORTRANGE tiene #REF! en FARMA!A2."
+                )
+            else:
+                for row in iter_sheet_records(
+                    workbook, "FARMA", ["WAREHOUSE_ID", "PRODUCT_ID"]
+                ):
+                    destination = to_id(
+                        row["WAREHOUSE_ID"], "FARMA.WAREHOUSE_ID", True
+                    )
+                    sku = to_id(row["PRODUCT_ID"], "FARMA.PRODUCT_ID", True)
+                    if destination is not None and sku is not None:
+                        farma_block_pairs.add((destination, sku))
 
         route_cost_blocks: set[tuple[int, int]] = set()
         for row in iter_sheet_records(
@@ -1065,6 +1101,7 @@ def load_catalogs(
         # Cada par destino-origen de SCHEDULE es independiente y opcional; la
         # ausencia de la hoja en sí no bloquea la carga (ver iter_schedule_records).
         schedule_days: dict[tuple[int, int], frozenset[str]] = {}
+        schedule_days_by_storage: dict[tuple[int, int, str], frozenset[str]] = {}
         for row in iter_schedule_records(workbook):
             destination = to_id(row["WAREHOUSE_ID"], "SCHEDULE.WAREHOUSE_ID", True)
             origin = to_id(row["ORIGEN"], "SCHEDULE.ORIGEN", True)
@@ -1083,7 +1120,16 @@ def load_catalogs(
             if not days_set:
                 continue
             key = (destination, origin)
-            if key in schedule_days and schedule_days[key] != days_set:
+            storage_type = clean_text(row.get("STORAGE_TYPE"))
+            if storage_type:
+                typed_key = (destination, origin, storage_type.casefold())
+                schedule_days_by_storage[typed_key] = (
+                    schedule_days_by_storage.get(typed_key, frozenset()) | days_set
+                )
+                # The generic map is also maintained as a union so the store
+                # universe can still be built before a SKU is known.
+                schedule_days[key] = schedule_days.get(key, frozenset()) | days_set
+            elif key in schedule_days and schedule_days[key] != days_set:
                 warnings.append(
                     f"SCHEDULE: WAREHOUSE_ID {destination} + ORIGEN {origin} "
                     "aparece más de una vez con días distintos; se combinaron "
@@ -1145,7 +1191,7 @@ def load_catalogs(
                 f"El origen {origin} no existe en TIENDA; no puedo evaluar bloqueos regionales"
             )
 
-    return Catalogs(
+        return Catalogs(
         volume_m3=volume_m3,
         blocked_products=blocked_products,
         route_cost_blocks=route_cost_blocks,
@@ -1172,10 +1218,12 @@ def load_catalogs(
         golden_products=golden_products,
         anchor_products=anchor_products,
         owner_stock=dict(owner_stock),
-        schedule_days=schedule_days,
+            schedule_days=schedule_days,
+            schedule_days_by_storage=schedule_days_by_storage,
         run_weekday_norm=run_weekday_norm,
         copernico_unusable_by_reason=copernico_unusable_by_reason,
         globally_blocked_skus=globally_blocked_skus,
+        farma_block_pairs=farma_block_pairs,
         product_catalog=product_catalog,
         swa_potential_gain=swa_potential_gain,
         incoming_stock=dict(incoming_stock),
@@ -1718,11 +1766,20 @@ def is_regional_block(
     )
 
 
-def is_schedule_blocked(catalogs: Catalogs, source: int, destination: int) -> bool:
-    """Bloquea un origen-destino si hoy no es un día permitido en SCHEDULE."""
+def is_schedule_blocked(
+    catalogs: Catalogs, source: int, destination: int, sku: int | None = None
+) -> bool:
+    """Bloquea según SCHEDULE, usando la fila del STORAGE_TYPE del SKU."""
     if not catalogs.schedule_block_enabled:
         return False
-    allowed_days = catalogs.schedule_days.get((destination, source))
+    allowed_days = None
+    if sku is not None:
+        storage_type = source_storage_type(catalogs, source, sku).casefold()
+        allowed_days = catalogs.schedule_days_by_storage.get(
+            (destination, source, storage_type)
+        )
+    if not allowed_days:
+        allowed_days = catalogs.schedule_days.get((destination, source))
     if not allowed_days:
         return False
     return catalogs.run_weekday_norm not in allowed_days
@@ -1953,7 +2010,7 @@ def plan_transfers(
                 is_golden,
             )
             schedule_blocks[source] = is_schedule_blocked(
-                catalogs, source, destination
+                catalogs, source, destination, sku
             )
 
         allocations: list[tuple[int, int]] = []
@@ -1966,11 +2023,21 @@ def plan_transfers(
         capacity_target = 0
 
         forced_source = row.get("FORCED_SOURCE")
-        is_forced = "FORCED_SOURCE" in row
-        allow_partial = bool(row.get("ALLOW_PARTIAL", False))
-        forced_source_valid = (
-            not is_forced or forced_source in config.origin_warehouses
+        # Naked conserva la cantidad/destino/SKU definidos por Fountain9,
+        # pero consume los orígenes configurados en el CODEC en su orden.
+        # La fuente Fountain9 queda como referencia para auditoría. El resto
+        # de usos históricos de FORCED_SOURCE conserva el origen estricto.
+        prioritize_codec_sources = bool(row.get("SOURCE_PRIORITY_CODEC", False))
+        # Fountain9 puede traer un source vacío o que ya no existe. Eso no
+        # invalida la necesidad: en ese caso la línea vuelve al conjunto
+        # completo de orígenes y se cubre desde cualquier stock utilizable.
+        forced_source_valid = forced_source in config.origin_warehouses
+        is_forced = (
+            not prioritize_codec_sources
+            and "FORCED_SOURCE" in row
+            and forced_source_valid
         )
+        allow_partial = bool(row.get("ALLOW_PARTIAL", False))
         eligible_sources = (
             (int(forced_source),)
             if is_forced and forced_source_valid
@@ -1980,15 +2047,6 @@ def plan_transfers(
         if target <= 0:
             tipo_corte = "SIN DEMANDA"
             detalle_motivo = "MOV cero y no activa reglas de hardcode"
-        elif is_forced and not forced_source_valid:
-            tipo_corte = "F9 SIN ORIGEN" if forced_source is None else "F9 ORIGEN INVALIDO"
-            detalle_motivo = (
-                "Fountain9 no indicó Source Id Before Multi Source"
-                if forced_source is None
-                else f"El origen Fountain9 {forced_source} no está configurado"
-            )
-            passes_capacity = False
-            passes_tasks = False
         elif not city_norm:
             tipo_corte = "ERROR DE DATOS"
             detalle_motivo = "El warehouse destino no existe en TIENDA"
@@ -2327,7 +2385,7 @@ def plan_transfers(
                 row["CITY_NORMALIZED"],
                 row["ES_GOLDEN"],
             )
-            schedule_blocked = is_schedule_blocked(catalogs, source, destination)
+            schedule_blocked = is_schedule_blocked(catalogs, source, destination, sku)
             second_pass_blocks[source] = blocked
             second_pass_schedule_blocks[source] = schedule_blocked
             if blocked or schedule_blocked:

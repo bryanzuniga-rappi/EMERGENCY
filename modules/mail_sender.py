@@ -3,9 +3,10 @@
 Posición: acción posterior a la corrida (botón "Enviar por mail" en resultados).
 Entrada: el dict ``run`` de execute_planning (archivos en disco) y la lista de destinatarios.
 Salida: un solo correo con COPÉRNICO, BASE_TRANSFERS, Sin recomendación y OVERVIEW.
-Regla clave: usa la cuenta de Google autorizada por OAuth (mismo cliente que
-Militaires) con el permiso ``gmail.send``; un token autorizado solo para Drive
-no puede enviar correo y se explica cómo reautorizarlo.
+Regla clave: usa la cuenta de Google autorizada por OAuth con el permiso
+``gmail.send``; un token autorizado solo para Drive no puede enviar correo y se
+explica cómo reautorizarlo. La publicación del ZIP en Drive pertenece a
+``les_enfants_terribles``.
 """
 
 from __future__ import annotations
@@ -128,6 +129,47 @@ def date_label(run: dict[str, Any]) -> str:
         return date.fromisoformat(str(raw)).strftime("%d-%m-%Y")
     match = re.search(r"(\d{2}-\d{2}-\d{4})", Path(str(run.get("zip", ""))).name)
     return match.group(1) if match else date.today().strftime("%d-%m-%Y")
+
+
+def drive_package_name(run: dict[str, Any]) -> str:
+    """Nombre del ZIP operativo que se subirá a la carpeta de Drive."""
+    origins = [str(int(origin)) for origin in run.get("origins", [])]
+    origins_label = "_".join(origins) or "SIN_ORIGEN"
+    return f"TR_{origins_label}_{date_label(run)}.zip"
+
+
+def configured_mail_oauth_refresh_token() -> str:
+    """Refresh token autorizado también para Gmail (no solo para Drive)."""
+    return _read_streamlit_secrets().get("MAIL_OAUTH_REFRESH_TOKEN", "")
+
+
+def upload_run_package_to_drive(run: dict[str, Any]) -> str:
+    """Compatibilidad: la publicación de ZIP pertenece a Les Enfants Terribles."""
+    try:
+        from modules.les_enfants_terribles import upload_planning_zip_to_drive
+
+        return upload_planning_zip_to_drive(run)
+    except Exception as exc:
+        raise MailError(f"No se pudo subir el ZIP a Drive: {exc}") from exc
+
+
+def send_drive_notification(
+    run: dict[str, Any], recipients: list[str], drive_link: str
+) -> None:
+    """Notifica por correo que el ZIP ya está en Drive, sin adjuntar archivos."""
+    if not recipients:
+        raise MailError("Agrega al menos un destinatario para la notificación.")
+    filename = drive_package_name(run)
+    message = EmailMessage()
+    message["To"] = ", ".join(recipients)
+    message["Subject"] = f"MOTHER BASE · ZIP disponible en Drive · {filename}"
+    message.set_content(
+        "La corrida de MOTHER BASE ya fue subida a Drive.\n\n"
+        f"Archivo: {filename}\n"
+        f"Abrir en Drive: {drive_link}\n\n"
+        "Este correo es solo una notificación; no contiene archivos adjuntos."
+    )
+    send_message(build_gmail_service(), message)
 
 
 def copernico_attachment_names(
