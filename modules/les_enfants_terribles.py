@@ -110,21 +110,39 @@ ORIGIN_WAREHOUSES = {
     856: "CEDIS - LOCAL MTY",
     49: "NODO ALTAVISTA",
 }
+CHEDRAUI_PRIORITY_ORIGINS: tuple[int, ...] = (831, 834)
+
+
+def effective_origin_order(
+    origins: Iterable[int],
+    prioritize_chedraui_origins: bool = False,
+) -> tuple[int, ...]:
+    """Devuelve el orden global que consumen todos los engines.
+
+    Con prioridad Chedraui activa, 831 y 834 se fuerzan al frente incluso si
+    no se marcaron en el selector. El resto conserva exactamente el orden de
+    CODEC y se eliminan duplicados para no evaluar un origen dos veces.
+    """
+    selected = tuple(dict.fromkeys(int(origin) for origin in origins))
+    if not prioritize_chedraui_origins:
+        return selected
+    return (
+        *CHEDRAUI_PRIORITY_ORIGINS,
+        *(origin for origin in selected if origin not in CHEDRAUI_PRIORITY_ORIGINS),
+    )
 
 ALEPH_SHEETS = {
     "CATALOGO",
     "KVI",
-    "SHARE_VENTAS",
     "NO_DISPONIBLE",
     "POR_MERMAR",
     "STOCK",
     "INSUMOS",
     "GOLDEN_INFALTABLES_ANCHOR",
     "TIENDA",
-    "STORAGE",
-    "OWNER",
     "DATA",
     "SWA",
+    "FARMA",
 }
 
 MANUAL_BACKEND_SHEETS = {"TIENDAS_CERRADAS", "PILOTO"}
@@ -144,15 +162,12 @@ REQUIRED_DATABASE_SHEETS = (
     "PILOTO",
     "CATALOGO",
     "KVI",
-    "SHARE_VENTAS",
     "NO_DISPONIBLE",
     "POR_MERMAR",
     "STOCK",
     "INSUMOS",
     "GOLDEN_INFALTABLES_ANCHOR",
     "TIENDA",
-    "STORAGE",
-    "OWNER",
     "SCHEDULE",
     "DATA",
     "SWA",
@@ -199,10 +214,6 @@ SHEET_DESCRIPTIONS = {
         "Override opcional de STORAGE_TYPE por warehouse origen y producto. "
         "WAREHOUSE_ID identifica el origen, nunca la tienda destino."
     ),
-    "OWNER": (
-        "Inventario disponible separado por owner. Para los orígenes 425 y 856 "
-        "divide los entregables de Turbo y Chedraui sin mezclar inventario."
-    ),
     "RACKEADOS": (
         "Productos rackeados por warehouse. Para el origen 444, estos productos "
         "se excluyen completamente del stock utilizable."
@@ -212,8 +223,8 @@ SHEET_DESCRIPTIONS = {
     ),
     "FARMA": (
         "Combinaciones WAREHOUSE_ID + PRODUCT_ID que se bloquean completamente "
-        "cuando la regla «Bloquear FARMA» está activa en CODEC. La conexión de "
-        "IMPORTRANGE se valida en FARMA!A2 porque los encabezados son manuales."
+        "cuando la regla «Bloquear FARMA» está activa en CODEC. Se actualiza "
+        "cada 24 horas desde Aleph."
     ),
     "PILOTO": (
         "Tiendas con ejecución restringida: sólo puede salir lo sugerido por "
@@ -241,7 +252,8 @@ SHEET_DESCRIPTIONS = {
     ),
     "STOCK": (
         "Stock disponible final por warehouse y producto. Es la fuente mandante "
-        "para determinar cuánto puede enviarse."
+        "para determinar cuánto puede enviarse e incluye OWNER_NAME para separar "
+        "los entregables de los orígenes que manejan más de un owner."
     ),
     "INSUMOS": (
         "Cantidades de insumos calculadas automáticamente por Aleph para cada "
@@ -253,15 +265,8 @@ SHEET_DESCRIPTIONS = {
         "INFALTABLES, GOLDEN y ANCHOR con jerarquía estricta en ese orden."
     ),
     "TIENDA": (
-        "Catálogo de warehouses con el nombre y la ciudad de cada tienda o nodo."
-    ),
-    "STORAGE": (
-        "Condición de almacenamiento de cada producto, como room temperature, "
-        "refrigerated o freezer."
-    ),
-    "SHARE_VENTAS": (
-        "Share general de ventas por tienda. Liquid Engine lo utiliza para "
-        "distribuir excedentes cuando ya no puede nivelar por DOH."
+        "Catálogo de warehouses con nombre, ciudad y SHARE. Liquid Engine usa "
+        "SHARE para distribuir excedentes cuando ya no puede nivelar por DOH."
     ),
     "SCHEDULE": (
         "Frecuencia de envío permitida por combinación de WAREHOUSE_ID destino "
@@ -276,7 +281,8 @@ SHEET_DESCRIPTIONS = {
         "etc.). SYNC_ID es la llave que empata con el SKU que usa todo el "
         "resto del sistema (RETAIL_ID de Fountain9, PRODUCT_ID de CATALOGO). "
         "Se usa para darle nombre y categoría legibles a reportes y "
-        "entregables, no para ninguna regla de negocio."
+        "entregables. TEMPERATURE_NAME también sustituye a la antigua hoja "
+        "STORAGE para definir el ambiente de cada SKU."
     ),
     "SWA": (
         "Sales Weighted Availability por WAREHOUSE_ID/PRODUCT_ID "
@@ -295,9 +301,7 @@ ALEPH_MAX_AGE_HOURS = {
     "CATALOGO": 24.0,
     "GOLDEN_INFALTABLES_ANCHOR": 24.0,
     "TIENDA": 24.0,
-    "STORAGE": 24.0,
-    "SHARE_VENTAS": 24.0,
-    "OWNER": 1.2,
+    "FARMA": 24.0,
     "DATA": 24.0,
     "SWA": 1.2,
 }
@@ -492,6 +496,8 @@ ENGINE_TOPUP_REGLA_DEMANDA: frozenset[str] = frozenset(
     }
 )
 PLANNING_REASON_FOUNTAIN9 = "FOUNTAIN9 · NAKED ENGINE"
+PLANNING_REASON_PILOT_FOUNTAIN9 = "PILOTO · CANTIDAD FOUNTAIN9 / ORIGEN CODEC"
+PLANNING_REASON_OTACON_F9_PROTECTED = "FOUNTAIN9 PROTEGIDO · OTACON ENGINE"
 PLANNING_REASON_OTACON = "REMANENTE · OTACON ENGINE"
 PLANNING_REASON_MANUAL_FORECAST_ZERO = "MÍNIMO · OTACON ENGINE"
 PLANNING_REASON_AVL = "CUBRIR AVL · SOLIDUS ENGINE"
@@ -523,11 +529,23 @@ INSUMO_STOCK_RULES = {
     90532: {"name": "INSUMO 90532", "target_stock": 1_050, "moq": 350},
 }
 
-# SKUs de INSUMOS limitados a ciertas ciudades: los renglones de otras tiendas
-# se descartan.
-INSUMO_CITY_RESTRICTIONS: dict[int, frozenset[str]] = {
-    90532: frozenset({"CDMX"}),
+# Restricción dura de destino para insumos sensibles. Es una whitelist que se
+# aplica al construir el BulkCD_444, independiente de lo que llegue desde
+# DATA_TRANSFERS / Aleph: fuera de esta lista, el SKU no puede salir.
+INSUMO_ALLOWED_DESTINATIONS: dict[int, frozenset[int]] = {
+    82126: frozenset({
+        129, 804, 847, 247, 389, 819, 89, 270, 327, 850, 320, 434,
+        53, 71, 63, 263, 52, 417, 184, 49,
+    }),
+    90532: frozenset({
+        129, 804, 847, 247, 389, 819, 89, 270, 327, 850, 320, 434,
+        53, 71, 63, 263, 52, 417, 184, 49,
+    }),
 }
+
+# Se mantiene el mecanismo para futuras reglas de ciudad, pero 82126 y 90532
+# ya no se filtran por ciudad: su whitelist contiene CDMX, GDL y MTY.
+INSUMO_CITY_RESTRICTIONS: dict[int, frozenset[str]] = {}
 
 CITY_DISPLAY_NAMES = {
     "CDMX": "Ciudad de México",
@@ -1017,8 +1035,6 @@ def database_sheet_type(sheet_name: str) -> str:
 def database_sheet_control(sheet_name: str) -> str:
     if sheet_name in ALEPH_SHEETS:
         return "C7"
-    if sheet_name == "FARMA":
-        return "A2"
     return "A1"
 
 
@@ -1367,12 +1383,6 @@ def inspect_database(
                     )
                 else:
                     detail = "A1 DEBE SER WAREHOUSE_ID"
-            elif sheet_name == "FARMA":
-                # A1 siempre es un encabezado escrito manualmente. El #REF! de
-                # IMPORTRANGE aparece en A2; revisar A1 daría falso positivo.
-                displayed_value = sheet["A2"].value
-                healthy = not contains_ref_error(displayed_value)
-                detail = "SIN #REF!" if healthy else "#REF! DETECTADO EN A2"
             else:
                 displayed_value = sheet["A1"].value
                 healthy = not contains_ref_error(displayed_value)
@@ -1978,6 +1988,8 @@ def enrich_consolidated_plan_read(
 def build_naked_fountain9_rows(
     instructions: list[dict[str, Any]],
     plan_rows: list[dict[str, Any]],
+    *,
+    forced_rule: str = "FOUNTAIN9_DOI",
 ) -> list[dict[str, Any]]:
     """Arma la cola Naked desde Allocation (DOI Based).
 
@@ -2001,13 +2013,62 @@ def build_naked_fountain9_rows(
             {
                 "FORCED_TARGET": int(instruction["QUANTITY"]),
                 "FORCED_SOURCE": instruction.get("WAREHOUSE_SOURCE"),
-                "FORCED_RULE": "FOUNTAIN9_DOI",
+                "FORCED_RULE": forced_rule,
                 "ALLOW_PARTIAL": True,
                 "SOURCE_PRIORITY_CODEC": True,
             }
         )
         naked_rows.append(base)
     return naked_rows
+
+
+def build_pilot_fountain9_codec_rows(
+    instructions: list[dict[str, Any]],
+    plan_rows: list[dict[str, Any]],
+    pilot_store_ids: set[int],
+) -> list[dict[str, Any]]:
+    """Construye la pasada PILOTO: cantidad DOI Fountain9, origen por CODEC.
+
+    La instrucción se consolida por destino-SKU para que DOI multi-source sea
+    un único techo de cantidad. Esta pasada es independiente de Naked: no usa
+    MOV, mínimos ni hardcodes y corre aunque Naked esté apagado.
+    """
+    by_key = {
+        (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"])): row
+        for row in plan_rows
+    }
+    requested: Counter[tuple[int, int]] = Counter()
+    f9_sources: dict[tuple[int, int], set[Any]] = defaultdict(set)
+    for instruction in instructions:
+        destination = int(instruction["WAREHOUSE_DESTINATION"])
+        sku = int(instruction["RETAIL_ID"])
+        key = (destination, sku)
+        if destination not in pilot_store_ids or key not in by_key:
+            continue
+        requested[key] += int(instruction.get("QUANTITY", 0) or 0)
+        source = instruction.get("WAREHOUSE_SOURCE")
+        if source is not None:
+            f9_sources[key].add(source)
+
+    rows: list[dict[str, Any]] = []
+    for (destination, sku), quantity in sorted(requested.items()):
+        if quantity <= 0:
+            continue
+        row = dict(by_key[(destination, sku)])
+        row.update(
+            {
+                "FORCED_TARGET": int(quantity),
+                "FORCED_SOURCE": None,
+                "F9_SOURCES_PILOTO": " | ".join(
+                    str(source) for source in sorted(f9_sources[(destination, sku)])
+                ),
+                "FORCED_RULE": "PILOTO_F9_CANTIDAD_CODEC",
+                "ALLOW_PARTIAL": True,
+                "SOURCE_PRIORITY_CODEC": True,
+            }
+        )
+        rows.append(row)
+    return rows
 
 
 def attach_consolidated_input_to_result(
@@ -2753,6 +2814,7 @@ def append_insumos_to_bulk_444(
         "lines_blocked_regional": 0,
         "lines_blocked_schedule": 0,
         "lines_blocked_city_restriction": 0,
+        "lines_blocked_destination_restriction": 0,
         "stock_detail": [],
         "swa_ganado": 0.0,
         "assigned_keys": set(),
@@ -2776,6 +2838,13 @@ def append_insumos_to_bulk_444(
         if destination not in eligible_destinations:
             continue
         if sku in catalogs.excluded_products:
+            continue
+        allowed_destinations = INSUMO_ALLOWED_DESTINATIONS.get(sku)
+        if (
+            allowed_destinations is not None
+            and destination not in allowed_destinations
+        ):
+            summary["lines_blocked_destination_restriction"] += 1
             continue
         store = catalogs.stores.get(destination, {})
         city_norm = store.get("city_norm", "")
@@ -3190,6 +3259,8 @@ ENGINE_COVERAGE_BY_CUT: dict[str, tuple[str, str]] = {
 }
 ENGINE_COVERAGE_BY_REASON: dict[str, tuple[str, str]] = {
     PLANNING_REASON_FOUNTAIN9: ("Naked", COVERAGE_FOUNTAIN9),
+    PLANNING_REASON_PILOT_FOUNTAIN9: ("Naked", COVERAGE_FOUNTAIN9),
+    PLANNING_REASON_OTACON_F9_PROTECTED: ("Otacon", COVERAGE_FOUNTAIN9),
     PLANNING_REASON_OTACON: ("Otacon", COVERAGE_FOUNTAIN9),
     PLANNING_REASON_MANUAL_FORECAST_ZERO: ("Otacon", COVERAGE_MINIMUMS),
     PLANNING_REASON_AVL: ("Solidus", COVERAGE_AVL),
@@ -3243,7 +3314,7 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
             "Envía a tiendas activadas por Naked, Otacon o Solidus desde el mismo origen; los mínimos solos no activan una ruta.",
             "Solo a las ciudades que cubre cada origen (444, 811, 831 y 834: CDMX; 425: Guadalajara; 856 y 49: Monterrey) más las que agregues.",
             "Puede evacuar solo un porcentaje de la merma y excluir categorías sensibles (Huevo).",
-            "Reparte parejo por ADU y luego por SHARE_VENTAS; POR_MERMAR no sustituye al stock final.",
+            "Reparte parejo por ADU y luego por SHARE de TIENDA; POR_MERMAR no sustituye al stock final.",
         ),
     },
     "Solidus": {
@@ -3281,7 +3352,7 @@ ENGINE_INFO: dict[str, dict[str, Any]] = {
         "how": (
             "Candidatos: SKUs manuales por origen y remanentes bajo el umbral.",
             "Solo envía a tiendas que ya recibieron unidades de otro engine en la corrida; no exige el SKU en CATALOGO.",
-            "Nivela con el ADU de CATALOGO hasta 14 DOH y reparte por SHARE_VENTAS sin rebasar stock, capacidad ni tareas.",
+            "Nivela con el ADU de CATALOGO hasta 14 DOH y reparte por SHARE de TIENDA sin rebasar stock, capacidad ni tareas.",
         ),
     },
     "Venom": {
@@ -3345,6 +3416,8 @@ def attribute_row(row: dict[str, Any]) -> tuple[str, str]:
         return (SWEEP_ONLY_ENGINE, NO_COVERAGE)
     if rule == "FOUNTAIN9_DOI":
         return ("Naked", COVERAGE_FOUNTAIN9)
+    if rule == "OTACON_F9_PROTEGIDO":
+        return ("Otacon", COVERAGE_FOUNTAIN9)
     if rule in MANUAL_FORECAST_ZERO_RULES:
         return ("Otacon", COVERAGE_MINIMUMS)
     return ("Otacon", COVERAGE_FOUNTAIN9)
@@ -4225,8 +4298,14 @@ def build_fountain9_audit(result, instructions, excluded=None, naked_enabled=Tru
         qty = int(row["QUANTITY"])
         reason = row.get(PLANNING_REASON_COLUMN, "")
         total[key] += qty
-        if reason == PLANNING_REASON_FOUNTAIN9:
-            naked[(row["WAREHOUSE_SOURCE"], *key)] += qty
+        if reason in (
+            PLANNING_REASON_FOUNTAIN9,
+            PLANNING_REASON_PILOT_FOUNTAIN9,
+            PLANNING_REASON_OTACON_F9_PROTECTED,
+        ):
+            # La cantidad Fountain9 se concilia por destino-SKU. El origen F9
+            # es referencia auditada; el origen efectivo puede venir de CODEC.
+            naked[key] += qty
         elif reason in (PLANNING_REASON_OTACON, PLANNING_REASON_MANUAL_FORECAST_ZERO):
             otacon[key] += qty
         else:
@@ -4235,7 +4314,7 @@ def build_fountain9_audit(result, instructions, excluded=None, naked_enabled=Tru
     final_cuts = defaultdict(set)
     for row in result.base_rows:
         key = (int(row["WAREHOUSE_DESTINATION"]), int(row["RETAIL_ID"]))
-        if row.get("REGLA_DEMANDA") == "FOUNTAIN9_DOI":
+        if row.get("REGLA_DEMANDA") in {"FOUNTAIN9_DOI", "OTACON_F9_PROTEGIDO"}:
             cuts[(row.get("F9_SOURCE"), *key)] = row.get("TIPO_DE_CORTE", "")
         if int(row.get("CANTIDAD_FALTANTE", 0) or 0) > 0:
             final_cuts[key].add(str(row.get("TIPO_DE_CORTE", "")))
@@ -4244,7 +4323,8 @@ def build_fountain9_audit(result, instructions, excluded=None, naked_enabled=Tru
         source = instruction.get("WAREHOUSE_SOURCE")
         key = (int(instruction["WAREHOUSE_DESTINATION"]), int(instruction["RETAIL_ID"]))
         requested = int(instruction["QUANTITY"])
-        literal = min(requested, naked[(source, *key)])
+        literal = min(requested, naked[key])
+        naked[key] -= literal
         recovered = min(requested - literal, otacon[key])
         otacon[key] -= recovered
         later = min(requested - literal - recovered, other[key])
@@ -7057,6 +7137,7 @@ def execute_planning(
     special_doh_target: float = 3.0,
     special_doh_targets: dict[str, float] | None = None,
     solidus_swa_priority: bool = True,
+    prioritize_chedraui_origins: bool = False,
     include_naked_engine: bool = True,
     include_otacon_engine: bool = True,
     cover_fountain9_hardcodes: bool = True,
@@ -7105,6 +7186,7 @@ def execute_planning(
     venom_manual_skus_by_origin: dict[int, set[int]] | None = None,
     venom_only_manual_skus: bool = False,
 ) -> dict[str, Any]:
+    origins = effective_origin_order(origins, prioritize_chedraui_origins)
     # El resultado anterior puede contener cientos de miles de diccionarios y
     # permanecer en session_state mientras se construye la siguiente corrida.
     # Liberarlo antes de abrir el XLSX evita que dos planeaciones convivan en
@@ -7177,6 +7259,11 @@ def execute_planning(
             config,
             copernico_csv_path=copernico_paths,
         )
+        if prioritize_chedraui_origins:
+            catalogs.warnings.append(
+                "Prioridad Chedraui activa: todos los engines consumen primero "
+                "831 y 834; los demás orígenes conservan el orden de CODEC."
+            )
         catalogs.origin_storage_override_enabled = bool(
             apply_origin_storage_override
         )
@@ -7249,8 +7336,9 @@ def execute_planning(
             pilot_ids_text = ", ".join(map(str, sorted(pilot_store_ids)))
             catalogs.warnings.append(
                 "Regla PILOTO activa: las tiendas "
-                f"{pilot_ids_text} sólo podrán recibir lo ejecutado por Naked/Fountain9; "
-                "los engines posteriores e Insumos quedan bloqueados."
+                f"{pilot_ids_text} recibirán como máximo la cantidad DOI de Fountain9, "
+                "surtida según el orden de orígenes de CODEC incluso si Naked está "
+                "apagado; los engines posteriores e Insumos quedan bloqueados."
             )
         excluded_sku_set = set(excluded_skus or ()) | catalogs.globally_blocked_skus
         manually_excluded_store_ids = set(excluded_store_ids or ())
@@ -7420,15 +7508,48 @@ def execute_planning(
             catalogs,
             config.origin_warehouses,
         )
-        # 1) Naked ejecuta la decisión ya tomada por Fountain9. No usa MOV,
-        # mínimos ni reasignación: Allocation DOI + Source Before Multi Source.
-        naked_rows = build_naked_fountain9_rows(
-            consolidation_summary.get("fountain9_instructions", []),
+        # 1) La cantidad DOI de Fountain9 se protege antes de cualquier
+        # ampliación. Con Naked activo se etiqueta como Naked; con Naked
+        # apagado, Otacon conserva exactamente esa primera pasada y únicamente
+        # cambia el origen mediante la prioridad de CODEC. PILOTO siempre opera
+        # con este último criterio.
+        fountain9_instructions = consolidation_summary.get(
+            "fountain9_instructions", []
+        )
+        non_pilot_plan_rows = [
+            row for row in daily_plan_rows
+            if row["WAREHOUSE_DESTINATION"] not in pilot_store_ids
+        ]
+        naked_rows = []
+        if include_naked_engine:
+            naked_rows = build_naked_fountain9_rows(
+                fountain9_instructions,
+                non_pilot_plan_rows,
+            )
+        elif include_otacon_engine:
+            naked_rows = build_naked_fountain9_rows(
+                fountain9_instructions,
+                non_pilot_plan_rows,
+                forced_rule="OTACON_F9_PROTEGIDO",
+            )
+        pilot_fountain9_rows = build_pilot_fountain9_codec_rows(
+            fountain9_instructions,
             daily_plan_rows,
-        ) if include_naked_engine else []
-        naked_result = engine.plan_transfers(naked_rows, catalogs, config)
+            pilot_store_ids,
+        )
+        naked_result = engine.plan_transfers(
+            naked_rows + pilot_fountain9_rows, catalogs, config
+        )
         for allocation in naked_result.allocation_rows:
-            allocation[PLANNING_REASON_COLUMN] = PLANNING_REASON_FOUNTAIN9
+            allocation[PLANNING_REASON_COLUMN] = (
+                PLANNING_REASON_PILOT_FOUNTAIN9
+                if allocation["WAREHOUSE_DESTINATION"] in pilot_store_ids
+                else (
+                    PLANNING_REASON_FOUNTAIN9
+                    if include_naked_engine
+                    else PLANNING_REASON_OTACON_F9_PROTECTED
+                )
+            )
 
         naked_executed: dict[tuple[int, int], int] = defaultdict(int)
         for allocation in naked_result.allocation_rows:
@@ -7456,9 +7577,9 @@ def execute_planning(
         )
         if not include_otacon_engine:
             engine_plan_rows = []
-        # PILOTO no altera Naked: Fountain9 conserva su ejecución literal.
         # Desde Otacon en adelante no existe residual ni hardcode que pueda
-        # ampliar una tienda piloto.
+        # ampliar una tienda PILOTO: su techo DOI ya se procesó con sourcing
+        # CODEC en la pasada inicial.
         engine_plan_rows = [
             row for row in engine_plan_rows
             if row["WAREHOUSE_DESTINATION"] not in pilot_store_ids
@@ -7993,8 +8114,8 @@ def execute_planning(
             )
 
         # Invariante de seguridad: aunque en el futuro se añada un engine,
-        # una tienda PILOTO nunca puede terminar con una línea posterior a
-        # Naked. Fallar explícitamente es preferible a enviar volumen extra.
+        # una tienda PILOTO nunca puede terminar con una línea posterior a su
+        # pasada DOI Fountain9 con sourcing CODEC.
         pilot_extra_allocations = [
             allocation
             for allocation in result.allocation_rows[len(naked_result.allocation_rows):]
@@ -8002,7 +8123,8 @@ def execute_planning(
         ]
         if pilot_extra_allocations:
             raise RuntimeError(
-                "Invariante PILOTO violada: un engine posterior a Naked intentó "
+                "Invariante PILOTO violada: un engine posterior a la pasada "
+                "Fountain9/CODEC intentó "
                 "asignar volumen a una tienda restringida."
             )
 
@@ -8247,7 +8369,7 @@ def execute_planning(
                 excluded_f9[(destination, sku)] = "CIUDAD_BLOQUEADA"
         fountain9_audit = build_fountain9_audit(
             result, consolidation_summary.get("fountain9_instructions", []),
-            excluded_f9, include_naked_engine,
+            excluded_f9, include_naked_engine or include_otacon_engine,
         )
         result.fountain9_audit = fountain9_audit
         result.build = APP_BUILD
@@ -11775,6 +11897,24 @@ def render() -> None:
                     "la prioridad, elimina las opciones y vuelve a elegirlas."
                 ),
             )
+            prioritize_chedraui_origins = st.toggle(
+                "Priorizar inventario Chedraui (831 / 834)",
+                value=False,
+                help=(
+                    "Fuerza 831 y 834 al inicio para todos los engines, incluso "
+                    "si no se seleccionaron arriba. Después se respetan los demás "
+                    "orígenes en el orden de CODEC y todas sus restricciones."
+                ),
+            )
+            planning_origins = effective_origin_order(
+                selected_origins,
+                prioritize_chedraui_origins,
+            )
+            if prioritize_chedraui_origins:
+                st.caption(
+                    "Orden efectivo de la corrida: "
+                    + " → ".join(map(str, planning_origins))
+                )
         with right:
             max_tasks = st.number_input(
                 "Máximo de tareas",
@@ -11876,8 +12016,7 @@ def render() -> None:
                 value=True,
                 help=(
                     "Bloquea por completo cada combinación WAREHOUSE_ID + PRODUCT_ID "
-                    "de la hoja FARMA. Si FARMA!A2 tiene #REF!, se avisa y no se "
-                    "interpreta la hoja."
+                    "de la hoja FARMA, actualizada por Aleph cada 24 horas."
                 ),
             )
 
@@ -12285,7 +12424,7 @@ def render() -> None:
             )
             st.rerun()
         if include_shalashaska_engine:
-            forced_cities = shalashaska_forced_cities(tuple(selected_origins))
+            forced_cities = shalashaska_forced_cities(tuple(planning_origins))
             city_names = {"CDMX": "Ciudad de México", "GDL": "Guadalajara", "MTY": "Monterrey"}
             if forced_cities:
                 st.markdown(
@@ -12418,8 +12557,8 @@ def render() -> None:
                 liquid_automatic_tail_origins = set(
                     st.multiselect(
                         "Orígenes habilitados para remanentes automáticos",
-                        options=list(selected_origins),
-                        default=list(selected_origins),
+                        options=list(planning_origins),
+                        default=list(planning_origins),
                         format_func=format_origin,
                         disabled=not liquid_automatic_tail,
                         help=(
@@ -12437,9 +12576,9 @@ def render() -> None:
                 )
 
             st.markdown("#### SKUs manuales a agotar por origen")
-            if selected_origins:
+            if planning_origins:
                 sku_columns = st.columns(2)
-                for index, origin in enumerate(selected_origins):
+                for index, origin in enumerate(planning_origins):
                     with sku_columns[index % 2]:
                         liquid_manual_skus_by_origin_raw[origin] = st.text_area(
                             f"{format_origin(origin)}",
@@ -12492,8 +12631,8 @@ def render() -> None:
             with venom_left:
                 venom_origins = st.multiselect(
                     "Orígenes (Venom)",
-                    options=list(selected_origins),
-                    default=list(selected_origins),
+                    options=list(planning_origins),
+                    default=list(planning_origins),
                     format_func=format_origin,
                     help=(
                         "Solo puede usar orígenes ya seleccionados arriba en "
@@ -12826,11 +12965,11 @@ def render() -> None:
         if not uploaded_plans:
             st.error("Primero sube al menos un CSV de planeación.")
             st.stop()
-        if not selected_origins:
+        if not planning_origins:
             st.error("Selecciona al menos un warehouse origen.")
             st.stop()
         origins_needing_copernico = (
-            set(selected_origins) & COPERNICO_REQUIRED_WAREHOUSES
+            set(planning_origins) & COPERNICO_REQUIRED_WAREHOUSES
         )
         if origins_needing_copernico:
             copernico_warehouses = detect_copernico_warehouses(uploaded_copernico)
@@ -12857,7 +12996,7 @@ def render() -> None:
             st.error("Activa al menos un engine para ejecutar la misión.")
             st.stop()
         try:
-            origins = tuple(selected_origins)
+            origins = tuple(planning_origins)
             excluded_skus = parse_manual_skus(excluded_skus_raw)
             liquid_manual_skus_by_origin = {
                 int(origin): parsed
@@ -13004,6 +13143,7 @@ def render() -> None:
                     special_doh_target=float(special_doh_target),
                     special_doh_targets=special_doh_targets,
                     solidus_swa_priority=solidus_swa_priority,
+                    prioritize_chedraui_origins=prioritize_chedraui_origins,
                     include_naked_engine=include_naked_engine,
                     include_otacon_engine=include_otacon_engine,
                     shalashaska_extra_cities=tuple(shalashaska_extra_cities),
